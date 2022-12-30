@@ -1,6 +1,8 @@
 import os
 import io
 import subprocess
+import abc
+import codes
 
 CARGO_TOML_TEMPLATE = """[package]
 name = "{project_name}"
@@ -15,92 +17,165 @@ bls12_381 = "0.7"
 rand = "0.8.5"
 """
 
-MAIN_RS_TEMPLATE = """use std::marker::PhantomData;
-use bellman::{ConstraintSystem, SynthesisError, Circuit};
-use bellman::groth16::{generate_random_parameters};
-use ff::PrimeField;
+MAIN_RS_TEMPLATE = """mod number;
+use number::Number;
+use bellman::groth16::{
+    create_random_proof, generate_random_parameters, prepare_verifying_key, verify_proof,
+};
+use bellman::{Circuit, ConstraintSystem, SynthesisError};
 use bls12_381::Bls12;
+use ff::PrimeField;
 use rand::thread_rng;
+use std::marker::PhantomData;
 
 #[derive(Debug, Default, Clone)]
 pub struct GeneratedCircuit<S: PrimeField> {
-    pub _phantom: PhantomData<S>
+    pub _phantom: PhantomData<S>,
 }
 
-impl<S: PrimeField> Circuit<S>
-    for GeneratedCircuit<S>
-{
-    fn synthesize<CS: ConstraintSystem<S>>(
-        self,
-        cs: &mut CS,
-    ) -> Result<(), SynthesisError> {
+impl<S: PrimeField> Circuit<S> for GeneratedCircuit<S> {
+    fn synthesize<CS: ConstraintSystem<S>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
         {generated_code}
         Ok(())
     }
 }
 
 fn main() {
+    let mut rng = thread_rng();
     let params = {
         let c = GeneratedCircuit {
-            _phantom: PhantomData
+            _phantom: PhantomData,
         };
 
         generate_random_parameters::<Bls12, _, _>(c, &mut rng).unwrap()
     };
-
-    println!("Hello world!");
+    let pvk = prepare_verifying_key(&params.vk);
+    let c = GeneratedCircuit {
+        _phantom: PhantomData,
+    };
+    let proof = create_random_proof(c, &params, &mut rng).unwrap();
+    assert!(verify_proof(&pvk, &proof, &[]).is_ok());
 }
 """
+
+VAR_DECL_TEMPLATE = """
+let v{} = Number::alloc(&mut *cs,
+    {}
+)?;
+"""
+
+CONSTRAIN_TEMPLATE = """
+cs.enforce(
+    || "",
+    |lc| lc {a},
+    |lc| lc {b},
+    |lc| lc {c},
+);
+"""
+
+
+class Hint(metaclass=abc.ABCMeta):
+    @abc.abstractmethod
+    def generate_rust(self):
+        pass
+
+
+class Constant(Hint):
+    def __init__(self, constant: int):
+        self.constant = constant
+
+    def generate_rust(self):
+        return "Some(S::from({}))".format(self.constant)
+
+
+class Multiply(Hint):
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+
+    def generate_rust(self):
+        return a.hint.generate_rust() + " * " + b.hint.generate_rust()
 
 
 class Context:
     def __init__(self):
         self.vars = []
         self.constrains = []
+        self.numbers = []
 
-    def alloc(self):
-        v = Variable(self, len(self.vars))
+    def alloc(self, hint):
+        v = Variable(self, len(self.vars), hint)
         self.vars.append(v)
-        return Number(self, {v.index: 1})
+        return Number(self, {v.index: 1}, hint)
 
     # A * B == C
     def constrain(self, a, b, c):
         self.constrains.append((a, b, c))
 
+    def add_number(self, num):
+        self.numbers.append(num.vars.copy())
+
     def mul(self, a, b):
-        ret = self.alloc()
+        ret = self.alloc(hint=Multiply(a, b))
         self.constrain(a, b, ret)
         return ret
 
     def compile(self, path, project_name):
+        libs = {"number": codes.NUMBER_RS}
+
         proj = os.path.join(path, project_name)
         cargo_toml = os.path.join(proj, "Cargo.toml")
         with io.open(cargo_toml, "w") as f:
             f.write(CARGO_TOML_TEMPLATE.format(project_name=project_name))
         src = os.path.join(proj, "src")
         os.makedirs(src, exist_ok=True)
+
+        for (file_name, content) in libs.items():
+            with io.open(os.path.join(src, file_name + ".rs"), "w") as f:
+                f.write(content)
+
         main_rs = os.path.join(src, "main.rs")
 
         generated_code = ""
+        for v in self.vars:
+            generated_code += VAR_DECL_TEMPLATE.format(v.index, v.hint.generate_rust())
+        for (a, b, c) in self.constrains:
+
+            def number_lc_add(n: Number):
+                return " ".join(
+                    [
+                        "+ (S::from({}),v{}.get_lc())".format(coeff, ind)
+                        if coeff != 1
+                        else "+ v{}.get_lc()".format(ind)
+                        for ind, coeff in n.vars.items()
+                    ]
+                )
+
+            generated_code += CONSTRAIN_TEMPLATE.format(
+                a=number_lc_add(a), b=number_lc_add(b), c=number_lc_add(c)
+            )
 
         with io.open(main_rs, "w") as f:
             f.write(MAIN_RS_TEMPLATE.replace("{generated_code}", generated_code))
+        subprocess.run(["cargo", "fmt", "--manifest-path", cargo_toml])
         subprocess.run(["cargo", "run", "--manifest-path", cargo_toml])
 
 
 class Variable:
-    def __init__(self, ctx, index):
+    def __init__(self, ctx, index, hint):
         self.ctx = ctx
         self.index = index
+        self.hint = hint
 
     def __str__(self):
         return "Variable({})".format(self.index)
 
 
 class Number:
-    def __init__(self, ctx, vars):
+    def __init__(self, ctx, vars, hint):
         self.ctx = ctx
         self.vars = vars
+        self.hint = hint
 
     def __mul__(self, other):
         if type(other) == int:
@@ -126,6 +201,7 @@ class Number:
 
 
 ctx = Context()
-a = ctx.alloc()
-b = ctx.alloc()
+a = ctx.alloc(Constant(3))
+b = ctx.alloc(Constant(4))
+c = a * b
 ctx.compile(".", "circuit")
