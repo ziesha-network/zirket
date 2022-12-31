@@ -17,8 +17,14 @@ bls12_381 = "0.7"
 rand = "0.8.5"
 """
 
-MAIN_RS_TEMPLATE = """mod number;
+MAIN_RS_TEMPLATE = """
+mod number;
+mod uint;
+#[allow(unused_imports)]
 use number::Number;
+#[allow(unused_imports)]
+use uint::UnsignedInteger;
+
 use bellman::groth16::{
     create_random_proof, generate_random_parameters, prepare_verifying_key, verify_proof,
 };
@@ -183,7 +189,7 @@ class Context:
         return ret
 
     def compile(self, path, project_name):
-        libs = {"number": codes.NUMBER_RS}
+        libs = {"number": codes.NUMBER_RS, "uint": codes.UINT_RS}
 
         proj = os.path.join(path, project_name)
         cargo_toml = os.path.join(proj, "Cargo.toml")
@@ -194,7 +200,7 @@ class Context:
 
         for (file_name, content) in libs.items():
             with io.open(os.path.join(src, file_name + ".rs"), "w") as f:
-                f.write(content)
+                f.write("#![allow(dead_code)]\n" + content)
 
         main_rs = os.path.join(src, "main.rs")
 
