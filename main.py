@@ -58,14 +58,11 @@ fn main() {
 }
 """
 
-VAR_DECL_TEMPLATE = """
-let v{} = Number::alloc(&mut *cs,
+VAR_DECL_TEMPLATE = """let v{} = Number::alloc(&mut *cs,
     {}
-)?;
-"""
+)?;"""
 
-CONSTRAIN_TEMPLATE = """
-cs.enforce(
+CONSTRAIN_TEMPLATE = """cs.enforce(
     || "",
     |lc| lc {a},
     |lc| lc {b},
@@ -88,25 +85,48 @@ class Constant(Hint):
         return "Some(S::from({}))".format(self.constant)
 
 
+class Add(Hint):
+    def __init__(self, a, b):
+        self.a = a
+        self.b = b
+
+    def generate_rust(self):
+        return a.hint.generate_rust() + " + " + b.hint.generate_rust()
+
+
 class Multiply(Hint):
     def __init__(self, a, b):
         self.a = a
         self.b = b
 
     def generate_rust(self):
-        return a.hint.generate_rust() + " * " + b.hint.generate_rust()
+        def expand(num):
+            expanded = "+".join(
+                [
+                    "(S::from({}), &v{})".format(coeff, ind)
+                    if coeff != 1
+                    else "&v{}".format(ind)
+                    for (ind, coeff) in num.vars.items()
+                ]
+            )
+            if expanded.startswith("(S::from"):
+                expanded = "(&Number::zero() + " + expanded + ")"
+            return "(" + expanded + ")"
+
+        return "{}.get_value().zip({}.get_value()).map(|(a,b)|a*b)".format(
+            expand(self.a), expand(self.b)
+        )
 
 
 class Context:
     def __init__(self):
         self.vars = []
         self.constrains = []
-        self.numbers = []
 
     def alloc(self, hint):
         v = Variable(self, len(self.vars), hint)
         self.vars.append(v)
-        return Number(self, {v.index: 1}, hint)
+        return Number(self, {v.index: 1})
 
     # A * B == C
     def constrain(self, a, b, c):
@@ -138,7 +158,9 @@ class Context:
 
         generated_code = ""
         for v in self.vars:
-            generated_code += VAR_DECL_TEMPLATE.format(v.index, v.hint.generate_rust())
+            generated_code += (
+                VAR_DECL_TEMPLATE.format(v.index, v.hint.generate_rust()) + "\n"
+            )
         for (a, b, c) in self.constrains:
 
             def number_lc_add(n: Number):
@@ -151,8 +173,11 @@ class Context:
                     ]
                 )
 
-            generated_code += CONSTRAIN_TEMPLATE.format(
-                a=number_lc_add(a), b=number_lc_add(b), c=number_lc_add(c)
+            generated_code += (
+                CONSTRAIN_TEMPLATE.format(
+                    a=number_lc_add(a), b=number_lc_add(b), c=number_lc_add(c)
+                )
+                + "\n"
             )
 
         with io.open(main_rs, "w") as f:
@@ -172,10 +197,9 @@ class Variable:
 
 
 class Number:
-    def __init__(self, ctx, vars, hint):
+    def __init__(self, ctx, vars):
         self.ctx = ctx
         self.vars = vars
-        self.hint = hint
 
     def __mul__(self, other):
         if type(other) == int:
@@ -188,7 +212,7 @@ class Number:
     def __add__(self, other):
         new_vars = self.vars.copy()
         if type(other) == Number:
-            for coeff, v in other.vars.items():
+            for v, coeff in other.vars.items():
                 if v not in new_vars:
                     new_vars[v] = 0
                 new_vars[v] += coeff
@@ -203,5 +227,6 @@ class Number:
 ctx = Context()
 a = ctx.alloc(Constant(3))
 b = ctx.alloc(Constant(4))
-c = a * b
+c = (a + b) * b
+d = (b * 2) * (c * 3)
 ctx.compile(".", "circuit")

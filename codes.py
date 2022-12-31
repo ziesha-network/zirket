@@ -34,23 +34,23 @@ impl<S: PrimeField> Number<S> {
     }
 }
 
-impl<S: PrimeField> Add for Number<S> {
-    type Output = Self;
+impl<S: PrimeField> Add<&Number<S>> for &Number<S> {
+    type Output = Number<S>;
 
-    fn add(self, other: Self) -> Self {
-        Self {
-            lc: self.lc + &other.lc,
+    fn add(self, other: &Number<S>) -> Self::Output {
+        Self::Output {
+            lc: self.lc.clone() + &other.lc,
             val: self.val.zip(other.val).map(|(slf, othr)| slf + othr),
         }
     }
 }
 
-impl<S: PrimeField> Add<(S, Number<S>)> for Number<S> {
+impl<S: PrimeField> Add<(S, &Number<S>)> for &Number<S> {
     type Output = Number<S>;
 
-    fn add(self, other: (S, Number<S>)) -> Self {
-        Self {
-            lc: self.lc + (other.0, &other.1.lc),
+    fn add(self, other: (S, &Number<S>)) -> Self::Output {
+        Self::Output {
+            lc: self.lc.clone() + (other.0, &other.1.lc),
             val: self
                 .val
                 .zip(other.1.val)
