@@ -19,28 +19,25 @@ rand = "0.8.5"
 
 MAIN_RS_TEMPLATE = """
 mod number;
-mod uint;
 #[allow(unused_imports)]
 use number::Number;
-#[allow(unused_imports)]
-use uint::UnsignedInteger;
 
 use bellman::groth16::{
     create_random_proof, generate_random_parameters, prepare_verifying_key, verify_proof,
 };
 use bellman::{Circuit, ConstraintSystem, SynthesisError};
 use bls12_381::Bls12;
-use ff::PrimeField;
+use ff::{PrimeField, PrimeFieldBits};
 use rand::thread_rng;
 use std::marker::PhantomData;
 
 #[derive(Debug, Default, Clone)]
-pub struct GeneratedCircuit<S: PrimeField> {
+pub struct GeneratedCircuit<S: PrimeField + PrimeFieldBits> {
     pub gen_params: bool,
     pub _phantom: PhantomData<S>,
 }
 
-impl<S: PrimeField> Circuit<S> for GeneratedCircuit<S> {
+impl<S: PrimeField + PrimeFieldBits> Circuit<S> for GeneratedCircuit<S> {
     fn synthesize<CS: ConstraintSystem<S>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
         {generated_code}
         Ok(())
@@ -118,6 +115,17 @@ class Multiply(Hint):
         )
 
 
+class ToBits(Hint):
+    def __init__(self, num, bits):
+        self.num = num
+        self.bits = bits
+
+    def generate_rust(self):
+        return "{}.get_value().map(|n|n.to_le_bits().iter().map(|b| Some(if *b{{S::one()}} else {{S::zero()}})).collect::<Vec<_>>()).unwrap_or(vec![None; {}])".format(
+            expand_number(self.num), self.bits
+        )
+
+
 class Loop:
     def __init__(self, ctx, cnt):
         self.ctx = ctx
@@ -161,6 +169,15 @@ class Context:
         )
         return Number(self, {v.index: 1})
 
+    def alloc_many(self, hint):
+        self.output += (
+            "let vars = {}.into_iter().map(|v|Number::alloc(&mut *cs, v)).collect::<Result<Vec<Number<S>>, SynthesisError>>();".format(
+                hint.generate_rust()
+            )
+            + "\n"
+        )
+        # return Number(self, {v.index: 1})
+
     # A * B == C
     def constrain(self, a, b, c):
         def number_lc_add(n: Number):
@@ -189,7 +206,7 @@ class Context:
         return ret
 
     def compile(self, path, project_name):
-        libs = {"number": codes.NUMBER_RS, "uint": codes.UINT_RS}
+        libs = {"number": codes.NUMBER_RS}
 
         proj = os.path.join(path, project_name)
         cargo_toml = os.path.join(proj, "Cargo.toml")
@@ -257,10 +274,9 @@ class Number:
 
 
 ctx = Context()
+
+
 a = ctx.alloc(Constant(3), mutable=True)
-with ctx.loop(2):
-    with ctx.loop(3):
-        ctx.print("Hi")
-        ctx.print_num(a)
-        a.set(a * a)
+print(a)
+aaa = ctx.alloc_many(ToBits(a, 16))
 ctx.compile(".", "circuit")
