@@ -87,15 +87,6 @@ class Constant(Hint):
         return "Some(S::from({}))".format(self.constant)
 
 
-class Add(Hint):
-    def __init__(self, a, b):
-        self.a = a
-        self.b = b
-
-    def generate_rust(self):
-        return a.hint.generate_rust() + " + " + b.hint.generate_rust()
-
-
 def expand_number(num):
     expanded = "+".join(
         [
@@ -235,7 +226,6 @@ class Number:
 
     def set(self, other):
         self.ctx.set(self.as_variable(), other)
-        self.vars = other
 
     def __mul__(self, other):
         if type(other) == int:
