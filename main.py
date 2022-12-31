@@ -30,6 +30,7 @@ use std::marker::PhantomData;
 
 #[derive(Debug, Default, Clone)]
 pub struct GeneratedCircuit<S: PrimeField> {
+    pub gen_params: bool,
     pub _phantom: PhantomData<S>,
 }
 
@@ -44,6 +45,7 @@ fn main() {
     let mut rng = thread_rng();
     let params = {
         let c = GeneratedCircuit {
+            gen_params: true,
             _phantom: PhantomData,
         };
 
@@ -51,6 +53,7 @@ fn main() {
     };
     let pvk = prepare_verifying_key(&params.vk);
     let c = GeneratedCircuit {
+        gen_params: false,
         _phantom: PhantomData,
     };
     let proof = create_random_proof(c, &params, &mut rng).unwrap();
@@ -58,7 +61,7 @@ fn main() {
 }
 """
 
-VAR_DECL_TEMPLATE = """let v{} = Number::alloc(&mut *cs,
+VAR_DECL_TEMPLATE = """let {} v{} = Number::alloc(&mut *cs,
     {}
 )?;"""
 
@@ -67,8 +70,7 @@ CONSTRAIN_TEMPLATE = """cs.enforce(
     |lc| lc {a},
     |lc| lc {b},
     |lc| lc {c},
-);
-"""
+);"""
 
 
 class Hint(metaclass=abc.ABCMeta):
@@ -94,43 +96,92 @@ class Add(Hint):
         return a.hint.generate_rust() + " + " + b.hint.generate_rust()
 
 
+def expand_number(num):
+    expanded = "+".join(
+        [
+            "(S::from({}), &v{})".format(coeff, ind)
+            if coeff != 1
+            else "&v{}".format(ind)
+            for (ind, coeff) in num.vars.items()
+        ]
+    )
+    if expanded.startswith("(S::from"):
+        expanded = "(&Number::zero() + " + expanded + ")"
+    return "(" + expanded + ")"
+
+
 class Multiply(Hint):
     def __init__(self, a, b):
         self.a = a
         self.b = b
 
     def generate_rust(self):
-        def expand(num):
-            expanded = "+".join(
-                [
-                    "(S::from({}), &v{})".format(coeff, ind)
-                    if coeff != 1
-                    else "&v{}".format(ind)
-                    for (ind, coeff) in num.vars.items()
-                ]
-            )
-            if expanded.startswith("(S::from"):
-                expanded = "(&Number::zero() + " + expanded + ")"
-            return "(" + expanded + ")"
-
         return "{}.get_value().zip({}.get_value()).map(|(a,b)|a*b)".format(
-            expand(self.a), expand(self.b)
+            expand_number(self.a), expand_number(self.b)
         )
+
+
+class Loop:
+    def __init__(self, ctx, cnt):
+        self.ctx = ctx
+        self.cnt = cnt
+
+    def __enter__(self):
+        self.ctx.output += "for _ in 0..{} {{\n".format(self.cnt)
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self.ctx.output += "\n}"
 
 
 class Context:
     def __init__(self):
         self.vars = []
-        self.constrains = []
+        self.output = ""
 
-    def alloc(self, hint):
+    def loop(self, cnt):
+        return Loop(self, cnt)
+
+    def print_num(self, num):
+        self.output += 'if !self.gen_params {{ println!("{{:?}}", {}.get_value().unwrap()); }}\n'.format(
+            expand_number(num)
+        )
+
+    def print(self, s):
+        self.output += 'if !self.gen_params {{ println!("{}"); }}\n'.format(s)
+
+    def set(self, dst, src):
+        self.output += "v{} = {}.clone();".format(dst, expand_number(src))
+
+    def alloc(self, hint, mutable=False):
         v = Variable(self, len(self.vars), hint)
         self.vars.append(v)
+        self.output += (
+            VAR_DECL_TEMPLATE.format(
+                "mut" if mutable else "", v.index, v.hint.generate_rust()
+            )
+            + "\n"
+        )
         return Number(self, {v.index: 1})
 
     # A * B == C
     def constrain(self, a, b, c):
-        self.constrains.append((a, b, c))
+        def number_lc_add(n: Number):
+            return " ".join(
+                [
+                    "+ (S::from({}),v{}.get_lc())".format(coeff, ind)
+                    if coeff != 1
+                    else "+ v{}.get_lc()".format(ind)
+                    for ind, coeff in n.vars.items()
+                ]
+            )
+
+        self.output += (
+            CONSTRAIN_TEMPLATE.format(
+                a=number_lc_add(a), b=number_lc_add(b), c=number_lc_add(c)
+            )
+            + "\n"
+        )
 
     def add_number(self, num):
         self.numbers.append(num.vars.copy())
@@ -156,32 +207,8 @@ class Context:
 
         main_rs = os.path.join(src, "main.rs")
 
-        generated_code = ""
-        for v in self.vars:
-            generated_code += (
-                VAR_DECL_TEMPLATE.format(v.index, v.hint.generate_rust()) + "\n"
-            )
-        for (a, b, c) in self.constrains:
-
-            def number_lc_add(n: Number):
-                return " ".join(
-                    [
-                        "+ (S::from({}),v{}.get_lc())".format(coeff, ind)
-                        if coeff != 1
-                        else "+ v{}.get_lc()".format(ind)
-                        for ind, coeff in n.vars.items()
-                    ]
-                )
-
-            generated_code += (
-                CONSTRAIN_TEMPLATE.format(
-                    a=number_lc_add(a), b=number_lc_add(b), c=number_lc_add(c)
-                )
-                + "\n"
-            )
-
         with io.open(main_rs, "w") as f:
-            f.write(MAIN_RS_TEMPLATE.replace("{generated_code}", generated_code))
+            f.write(MAIN_RS_TEMPLATE.replace("{generated_code}", self.output))
         subprocess.run(["cargo", "fmt", "--manifest-path", cargo_toml])
         subprocess.run(["cargo", "run", "--manifest-path", cargo_toml])
 
@@ -200,6 +227,15 @@ class Number:
     def __init__(self, ctx, vars):
         self.ctx = ctx
         self.vars = vars
+
+    def as_variable(self):
+        if len(self.vars) != 1 or list(self.vars.items())[0][1] != 1:
+            raise Exception()
+        return list(self.vars.items())[0][0]
+
+    def set(self, other):
+        self.ctx.set(self.as_variable(), other)
+        self.vars = other
 
     def __mul__(self, other):
         if type(other) == int:
@@ -225,8 +261,10 @@ class Number:
 
 
 ctx = Context()
-a = ctx.alloc(Constant(3))
-b = ctx.alloc(Constant(4))
-c = (a + b) * b
-d = (b * 2) * (c * 3)
+a = ctx.alloc(Constant(3), mutable=True)
+with ctx.loop(2):
+    with ctx.loop(3):
+        ctx.print("Hi")
+        ctx.print_num(a)
+        a.set(a * a)
 ctx.compile(".", "circuit")
